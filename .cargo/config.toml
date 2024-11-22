@@ -1,0 +1,7 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = 'probe-rs run --chip STM32F746NGHx'
+rustflags = ["-C", "link-arg=-Tlink.x"]
+# rustflags = ["-C", "link-arg=-Tstm32f467.ld"]
