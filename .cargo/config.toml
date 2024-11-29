@@ -1,7 +1,15 @@
 [build]
 target = "thumbv7em-none-eabihf"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+    "-C", "link-arg=--nmagic"
+]
+
+[env]
+DEFMT_LOG = "trace"
 
 [target.thumbv7em-none-eabihf]
 runner = 'probe-rs run --chip STM32F746NGHx'
-rustflags = ["-C", "link-arg=-Tlink.x"]
+
 # rustflags = ["-C", "link-arg=-Tstm32f467.ld"]

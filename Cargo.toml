@@ -4,10 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7.5"
-panic-halt = "1.0.0"
-rtt-target = "0.6.0"
+embassy-stm32 = { version = "0.1.0", features = ["defmt", "stm32f746ng", "memory-x", "unstable-pac", "time-driver-any", "exti"]  }
+embassy-sync = { version = "0.6.1", features = ["defmt"] }
+embassy-executor = { version = "0.6.3", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "defmt", "integrated-timers"] }
+embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-net = { version = "0.5.0", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet"] }
+embedded-io-async = { version = "0.6.1" }
+embassy-usb = { version = "0.3.0", features = ["defmt"] }
+embassy-futures = { version = "0.1.0"}
+
+defmt = "0.3.9"
 defmt-rtt = "0.4.1"
-stm32f7xx-hal = { version = "0.8.0", features = ["stm32f746", "rt"] }
+
+static_cell = "2"
+
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+embedded-hal = "1.0.0"
 heapless = "0.8.0"
+rand_core = "0.6.4"
+
+[profile.release]
+debug = 2
