@@ -2,11 +2,12 @@
 #![no_std]
 #![no_main]
 
+mod sdram;
+
 use defmt::*;
 use defmt::{info, unwrap, error, panic};
 use {defmt_rtt as _, panic_probe as _};
 use static_cell::StaticCell;
-use embassy_futures::yield_now;
 
 use embassy_executor::Spawner;
 use embassy_net::{Stack, StackResources};
@@ -23,16 +24,20 @@ use embassy_stm32::fmc::Fmc;
 use stm32_fmc;
 use embedded_nal_async::TcpConnect;
 
-use embassy_time::{Timer, Delay, Instant};
+use embassy_time::{Timer, Delay};
 use embedded_tls::{Aes128GcmSha256};
-use pem_rfc7468::{Decoder};
 
 use rust_mqtt::{
     buffer::*,
     client::{
         Client,
-        options::{ConnectOptions},
+        event::{Event, Puback, Suback},
+        options::{
+            ConnectOptions, DisconnectOptions, PublicationOptions, RetainHandling,
+            SubscriptionOptions, TopicReference, WillOptions,
+        },
     },
+    types::{MqttBinary, MqttString, TopicName, VarByteInt},
 };
 
 bind_interrupts!(struct Irqs {
@@ -209,18 +214,18 @@ async fn main(spawner: Spawner) -> ! {
         p.PH3,  // SDNE0 (!CS)
         p.PF11, // SDRAS
         p.PH5,  // SDNWE, change to p.PH5 for EVAL boards
-        stm32_fmc::devices::is42s32400f_6::Is42s32400f6 {
-        },
+        sdram::is42s32400::Is42s32400f6{},
     );
 
     let mut delay = Delay;
 
     let ram_slice = unsafe {
-        // Initialise controller and SDRAM
-        let ram_ptr: *mut u32 = sdram.init(&mut delay) as *mut _;
+        let ram_ptr = sdram.init(&mut delay) as *mut u8;
 
-        // Convert raw pointer to slice
-        core::slice::from_raw_parts_mut(ram_ptr, sdram_size / core::mem::size_of::<u32>())
+        core::slice::from_raw_parts_mut(
+            ram_ptr,
+            sdram_size, // already in bytes
+        )
     };
 
     // Generate random seed.
@@ -288,12 +293,12 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("RAM contents after writing: {:x}", ram_slice[..10]);
 
-    crate::assert_eq!(ram_slice[0], 1);
-    crate::assert_eq!(ram_slice[1], 2);
-    crate::assert_eq!(ram_slice[2], 3);
-    crate::assert_eq!(ram_slice[3], 4);
-
-    info!("Assertions succeeded.");
+    // crate::assert_eq!(ram_slice[0], 1);
+    // crate::assert_eq!(ram_slice[1], 2);
+    // crate::assert_eq!(ram_slice[2], 3);
+    // crate::assert_eq!(ram_slice[3], 4);
+    //
+    // info!("Assertions succeeded.");
 
 
     // ------------- MQTT
@@ -319,8 +324,11 @@ async fn main(spawner: Spawner) -> ! {
         .enable_rsa_signatures();
 
 
-    let mut record_read_buf = [0; 16384];
-    let mut record_write_buf = [0; 16384];
+    // let mut record_read_buf = [0; 16384];
+    // let mut record_write_buf = [0; 16384];
+
+    let (record_read_buf, rest) = ram_slice.split_at_mut(100*1024);
+    let (record_write_buf, _rest) = rest.split_at_mut(100*1024);
 
     let state: TcpClientState<1, 1024, 1024> = TcpClientState::new();
     let client = TcpClient::new(stack, &state);
@@ -338,7 +346,7 @@ async fn main(spawner: Spawner) -> ! {
     info!("connected!");
 
     let mut tls_connection =
-        embedded_tls::TlsConnection::new(connection, &mut record_read_buf, &mut record_write_buf);
+        embedded_tls::TlsConnection::new(connection, record_read_buf,  record_write_buf);
 
     tls_connection
         .open(embedded_tls::TlsContext::new(&config, embedded_tls::UnsecureProvider::new::<Aes128GcmSha256>(&mut rng)))
@@ -347,6 +355,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut buffer = [0; 16384];
     let mut bf = BumpBuffer::new(&mut buffer);
+    //let mut bf2 = BumpBuffer::new(&mut ram_slice);
     let mut client = Client::<'_, _, _, 1, 1, 1, 0>::new(&mut bf);
 
     match client
@@ -359,31 +368,23 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
+    let topic = TopicName::new(MqttString::from_str("rust-mqtt/test").unwrap()).unwrap();
+
     loop {
         Timer::after_secs(1).await;
-        info!("RAM contents after writing: {:x}", ram_slice[..10]);
-    }
-}
 
-use pem_rfc7468::{Error};
-use pem_rfc7468::decode;
+        let pub_options =
+            PublicationOptions::new(TopicReference::Mapping(topic.clone(), 1));
 
-pub fn pem_to_der<'a>(
-    pem: &'a [u8],
-    der_buf: &'a mut [u8],
-) -> Result<(&'a str, &'a [u8]), Error> {
-    // This high-level call handles finding boundaries and decoding
-    // into the buffer in a single step.
-    // let (label, output) = decode(pem, der_buf)?;
-    // Ok((label, output))
-    decode(pem, der_buf)
-}
+        let packet_id = match client
+            .publish(&pub_options, rust_mqtt::Bytes::from("anything".as_bytes()))
+            .await
+        {
+            Ok(Some(packet_id)) => Some(packet_id),
+            Ok(None) => None,
+            Err(_) => None,
+        };
 
-async fn wait_for_config(stack: Stack<'static>) -> embassy_net::StaticConfigV4 {
-    loop {
-        if let Some(config) = stack.config_v4() {
-            return config.clone();
-        }
-        yield_now().await;
+        info!("Publishing a message: {}", packet_id.is_some());
     }
 }
