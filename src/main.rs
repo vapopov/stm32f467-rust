@@ -3,28 +3,37 @@
 #![no_main]
 
 use defmt::*;
-use defmt::{info, unwrap};
+use defmt::{info, unwrap, error, panic};
 use {defmt_rtt as _, panic_probe as _};
 use static_cell::StaticCell;
-
 use embassy_futures::yield_now;
+
 use embassy_executor::Spawner;
-use embassy_net::{Stack, Ipv4Address, StackResources, Ipv4Cidr};
-use embassy_net::icmp::{ChecksumCapabilities, IcmpEndpoint, IcmpSocket, Icmpv4Packet, Icmpv4Repr, PacketMetadata};
+use embassy_net::{Stack, StackResources};
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use embassy_stm32::eth::{Ethernet, PacketQueue, GenericPhy,Sma};
 use embassy_stm32::peripherals::{ETH, ETH_SMA};
-use embassy_stm32::rng::Rng;
-
-use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, eth, peripherals, rng, Config};
-
-use embassy_time::{Timer, Delay, Instant};
-
+use embassy_stm32::rng::{Rng};
+use embassy_stm32::time::Hertz;
 use embassy_stm32::fmc::Fmc;
-use heapless::Vec;
 
 use stm32_fmc;
+use embedded_nal_async::TcpConnect;
+
+use embassy_time::{Timer, Delay, Instant};
+use embedded_tls::{Aes128GcmSha256};
+use pem_rfc7468::{Decoder};
+
+use rust_mqtt::{
+    buffer::*,
+    client::{
+        Client,
+        options::{ConnectOptions},
+    },
+};
 
 bind_interrupts!(struct Irqs {
     ETH => eth::InterruptHandler;
@@ -111,19 +120,18 @@ async fn main(spawner: Spawner) -> ! {
         const REGION_WRITE_BACK: u32 = 0x01;
         const REGION_ENABLE: u32 = 0x01;
 
-        crate::assert_eq!(size & (size - 1), 0, "SDRAM memory region size must be a power of 2");
-        crate::assert_eq!(size & 0x1F, 0, "SDRAM memory region size must be 32 bytes or more");
+        // crate::assert_eq!(size & (size - 1), 0, "SDRAM memory region size must be a power of 2");
+        // crate::assert_eq!(size & 0x1F, 0, "SDRAM memory region size must be 32 bytes or more");
         fn log2minus1(sz: u32) -> u32 {
             for i in 5..=31 {
                 if sz == (1 << i) {
                     return i - 1;
                 }
             }
-            crate::panic!("Unknown SDRAM memory region size!");
+            // crate::panic!("Unknown SDRAM memory region size!");
             sz
         }
 
-        //info!("SDRAM Memory Size 0x{:x}", log2minus1(size as u32));
 
         // Configure region 0
         //
@@ -242,12 +250,12 @@ async fn main(spawner: Spawner) -> ! {
         p.PC1, // mdc
     );
 
-    let config = embassy_net::Config::dhcpv4(Default::default());
-    // let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 8, 233), 24),
-    //    dns_servers: Vec::new(),
-    //    gateway: Some(Ipv4Address::new(192, 168, 8, 1)),
-    // });
+    // let config = embassy_net::Config::dhcpv4(Default::default());
+    let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+       address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 0, 2), 24),
+       dns_servers: heapless::Vec::new(),
+       gateway: None, // Some(Ipv4Address::new(192, 168, 8, 1)),
+    });
 
     // Init network stack
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
@@ -256,57 +264,12 @@ async fn main(spawner: Spawner) -> ! {
     // Launch network task
     spawner.spawn(unwrap!(net_task(runner)));
 
-    // Ensure DHCP configuration is up before trying connect
-    // stack.wait_config_up().await;
-    info!("Waiting for DHCP...");
-    let cfg = wait_for_config(stack).await;
-    let local_addr = cfg.address.address();
-    info!("IP address: {:?}", local_addr);
-
-    // Then we can use it!
-    let mut rx_buffer = [0; 256];
-    let mut tx_buffer = [0; 256];
-    let mut rx_meta = [PacketMetadata::EMPTY];
-    let mut tx_meta = [PacketMetadata::EMPTY];
-
-    // Identifier used for the ICMP socket
-    let ident = 42;
-
-    // Create and bind the socket
-    let mut socket = IcmpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
-    socket.bind(IcmpEndpoint::Ident(ident)).unwrap();
-
-    // Create the repr for the packet
-    let icmp_repr = Icmpv4Repr::EchoRequest {
-        ident,
-        seq_no: 0,
-        data: b"Hello, icmp!",
-    };
-
-    // Send the packet and store the starting instant to mesure latency later
-    let start = socket
-        .send_to_with(icmp_repr.buffer_len(), cfg.gateway.unwrap(), |buf| {
-            // Create and populate the packet buffer allocated by `send_to_with`
-            let mut icmp_packet = Icmpv4Packet::new_unchecked(buf);
-            icmp_repr.emit(&mut icmp_packet, &ChecksumCapabilities::default());
-            (icmp_repr.buffer_len(), Instant::now()) // Return the instant where the packet was sent
-        })
-        .await
-        .unwrap();
-
-    // Recieve and log the data of the reply
-    socket
-        .recv_from_with(|(buf, addr)| {
-            let packet = Icmpv4Packet::new_checked(buf).unwrap();
-            info!(
-                "Recieved {:?} from {} in {}ms",
-                packet.data(),
-                addr,
-                start.elapsed().as_millis()
-            );
-        })
-        .await
-        .unwrap();
+    // Ensure DHCP configuration is up before trying to connect.
+    stack.wait_config_up().await;
+    // info!("Waiting for DHCP...");
+    // let cfg = wait_for_config(stack).await;
+    // let local_addr = cfg.address.address();
+    // info!("IP address: {:?}", local_addr);
 
     // // ----------------------------------------------------------
     // // Use memory in SDRAM
@@ -332,10 +295,88 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Assertions succeeded.");
 
+
+    // ------------- MQTT
+
+    let mut ca_cert= [0u8; 2048];
+    let (label, ca_cert) = pem_rfc7468::decode(include_bytes!("/Users/vpopov/Projects/Projects/ca/mqtt/ca-crt.pem"), &mut ca_cert).unwrap();
+    info!("Decoded label: {}, {}", label, ca_cert.len());
+
+    let mut client_cert= [0u8; 2048];
+    let (label, client_cert) = pem_rfc7468::decode(include_bytes!("/Users/vpopov/Projects/Projects/ca/mqtt/client-crt.pem"), &mut client_cert).unwrap();
+    info!("Decoded label: {}, {}", label, client_cert.len());
+
+    let mut client_key= [0u8; 2048];
+    let (label, client_key) = pem_rfc7468::decode(include_bytes!("/Users/vpopov/Projects/Projects/ca/mqtt/client-key.pem"), &mut client_key).unwrap();
+    info!("Decoded label: {}, {}", label, client_key.len());
+
+
+    let config = embedded_tls::TlsConfig::new()
+        .with_ca(embedded_tls::Certificate::X509(&ca_cert))
+        .with_cert(embedded_tls::Certificate::X509(&client_cert))
+        .with_priv_key(&client_key)
+        .with_server_name("localhost")
+        .enable_rsa_signatures();
+
+
+    let mut record_read_buf = [0; 16384];
+    let mut record_write_buf = [0; 16384];
+
+    let state: TcpClientState<1, 1024, 1024> = TcpClientState::new();
+    let client = TcpClient::new(stack, &state);
+
+    // You need to start a server on the host machine, for example: `nc -l 8000`
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 1), 8883));
+
+    info!("connecting...");
+    let r = client.connect(addr).await;
+    if let Err(e) = r {
+        info!("connect error: {:?}", e);
+        Timer::after_secs(1).await;
+    }
+    let connection = r.unwrap();
+    info!("connected!");
+
+    let mut tls_connection =
+        embedded_tls::TlsConnection::new(connection, &mut record_read_buf, &mut record_write_buf);
+
+    tls_connection
+        .open(embedded_tls::TlsContext::new(&config, embedded_tls::UnsecureProvider::new::<Aes128GcmSha256>(&mut rng)))
+        .await
+        .expect("error establishing TLS connection");
+
+    let mut buffer = [0; 16384];
+    let mut bf = BumpBuffer::new(&mut buffer);
+    let mut client = Client::<'_, _, _, 1, 1, 1, 0>::new(&mut bf);
+
+    match client
+        .connect(tls_connection, &ConnectOptions::new().clean_start(), None)
+        .await
+    {
+        Ok(_c) => info!("Connected to server:"),
+        Err(_e) => {
+            error!("Failed to connect to server");
+        }
+    }
+
     loop {
         Timer::after_secs(1).await;
         info!("RAM contents after writing: {:x}", ram_slice[..10]);
     }
+}
+
+use pem_rfc7468::{Error};
+use pem_rfc7468::decode;
+
+pub fn pem_to_der<'a>(
+    pem: &'a [u8],
+    der_buf: &'a mut [u8],
+) -> Result<(&'a str, &'a [u8]), Error> {
+    // This high-level call handles finding boundaries and decoding
+    // into the buffer in a single step.
+    // let (label, output) = decode(pem, der_buf)?;
+    // Ok((label, output))
+    decode(pem, der_buf)
 }
 
 async fn wait_for_config(stack: Stack<'static>) -> embassy_net::StaticConfigV4 {
